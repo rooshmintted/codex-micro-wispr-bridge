@@ -113,6 +113,12 @@ private struct PermissionState {
 private final class WisprShortcutEmitter {
     private let dryRun: Bool
 
+    private enum KeyCode {
+        static let space: CGKeyCode = 49
+        static let option: CGKeyCode = 58
+        static let control: CGKeyCode = 59
+    }
+
     init(dryRun: Bool) {
         self.dryRun = dryRun
     }
@@ -128,21 +134,36 @@ private final class WisprShortcutEmitter {
             return
         }
 
-        guard
-            let source = CGEventSource(stateID: .hidSystemState),
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: true),
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: false)
-        else {
-            Log.error("Unable to create synthetic keyboard events.")
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            Log.error("Unable to create a keyboard event source.")
             return
         }
 
-        let flags: CGEventFlags = [.maskControl, .maskAlternate]
-        keyDown.flags = flags
-        keyUp.flags = flags
-        keyDown.post(tap: .cghidEventTap)
-        usleep(12_000)
-        keyUp.post(tap: .cghidEventTap)
+        // Wispr's global shortcut monitor expects modifier key transitions, not
+        // just modifier flags attached to a Space event. Emit the same sequence
+        // as a physical Control+Option+Space chord.
+        let sequence: [(keyCode: CGKeyCode, keyDown: Bool, flags: CGEventFlags)] = [
+            (KeyCode.control, true, [.maskControl]),
+            (KeyCode.option, true, [.maskControl, .maskAlternate]),
+            (KeyCode.space, true, [.maskControl, .maskAlternate]),
+            (KeyCode.space, false, [.maskControl, .maskAlternate]),
+            (KeyCode.option, false, [.maskControl]),
+            (KeyCode.control, false, [])
+        ]
+
+        for step in sequence {
+            guard let event = CGEvent(
+                keyboardEventSource: source,
+                virtualKey: step.keyCode,
+                keyDown: step.keyDown
+            ) else {
+                Log.error("Unable to create synthetic keyboard events.")
+                return
+            }
+            event.flags = step.flags
+            event.post(tap: .cghidEventTap)
+            usleep(8_000)
+        }
         Log.info("Sent Control+Option+Space to toggle Wispr Flow hands-free mode.")
     }
 }
