@@ -1,5 +1,6 @@
 import ApplicationServices
 import CoreGraphics
+import Dispatch
 import Foundation
 import IOKit.hid
 
@@ -8,6 +9,20 @@ private enum Device {
     static let productID = 0x8360
     static let vendorReportID: UInt32 = 6
     static let micKeyIDs: Set<String> = ["ACT10", "ACT11", "ACT10_ACT11"]
+}
+
+private enum MicGesture {
+    // Bluetooth reconnects can replay the keyboard's current switch state.
+    // Never interpret those startup packets as a new physical gesture.
+    static let reconnectGrace: TimeInterval = 3.0
+
+    // The wide Mic button contains two switches (ACT10 and ACT11). Their
+    // transitions may not arrive together, so wait briefly before deciding
+    // that the complete physical gesture has ended.
+    static let switchCoalescingWindow: TimeInterval = 0.25
+    static let minimumPressDuration: TimeInterval = 0.035
+    static let maximumPressDuration: TimeInterval = 4.0
+    static let triggerCooldown: TimeInterval = 0.75
 }
 
 private struct Configuration {
@@ -174,7 +189,11 @@ private final class CodexMicroBridge {
     private let emitter: WisprShortcutEmitter
     private var receiveBuffer = Data()
     private var pressedMicKeys = Set<String>()
-    private var lastMicEventTime: TimeInterval = 0
+    private var quarantinedMicKeys = Set<String>()
+    private var gestureStartedAt: TimeInterval?
+    private var gestureLastReleasedAt: TimeInterval?
+    private var pendingGestureFinalization: DispatchWorkItem?
+    private var acceptMicEventsAfter: TimeInterval = .greatestFiniteMagnitude
     private var lastTriggerTime: TimeInterval = 0
     private var connectedDeviceCount = 0
 
@@ -222,14 +241,19 @@ private final class CodexMicroBridge {
     }
 
     func deviceMatched(_ device: IOHIDDevice) {
+        if connectedDeviceCount == 0 {
+            resetMicGestureState()
+            acceptMicEventsAfter = ProcessInfo.processInfo.systemUptime + MicGesture.reconnectGrace
+        }
         connectedDeviceCount += 1
         let product = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String
-        Log.info("Connected to \(product ?? "Codex Micro") (\(connectedDeviceCount) matching interface(s)).")
+        Log.info("Connected to \(product ?? "Codex Micro") (\(connectedDeviceCount) matching interface(s)); Mic input quarantined for \(Int(MicGesture.reconnectGrace)) seconds.")
     }
 
     func deviceRemoved(_ device: IOHIDDevice) {
         connectedDeviceCount = max(0, connectedDeviceCount - 1)
-        pressedMicKeys.removeAll()
+        resetMicGestureState()
+        acceptMicEventsAfter = .greatestFiniteMagnitude
         receiveBuffer.removeAll(keepingCapacity: true)
         Log.info("Codex Micro disconnected; waiting for it to reconnect.")
     }
@@ -322,32 +346,139 @@ private final class CodexMicroBridge {
 
     private func handleMicEvent(keyID: String, action: Int) {
         let now = ProcessInfo.processInfo.systemUptime
-        if now - lastMicEventTime > 1.5 {
-            pressedMicKeys.removeAll()
+
+        if now < acceptMicEventsAfter {
+            pendingGestureFinalization?.cancel()
+            pendingGestureFinalization = nil
+            gestureStartedAt = nil
+            gestureLastReleasedAt = nil
+
+            if action == 1 {
+                quarantinedMicKeys.insert(keyID)
+            } else if action == 0 {
+                quarantinedMicKeys.remove(keyID)
+                pressedMicKeys.remove(keyID)
+            }
+
+            if configuration.verbose {
+                Log.info("Quarantined reconnect-state Mic action \(action) for \(keyID).")
+            }
+            return
         }
-        lastMicEventTime = now
 
         switch action {
         case 1:
-            let wasIdle = pressedMicKeys.isEmpty
-            pressedMicKeys.insert(keyID)
-
-            guard wasIdle, now - lastTriggerTime > 0.25 else {
+            // A key observed down during reconnect must return up before it can
+            // participate in a real gesture.
+            guard !quarantinedMicKeys.contains(keyID) else {
+                if configuration.verbose {
+                    Log.info("Ignored held reconnect-state Mic key \(keyID).")
+                }
                 return
             }
-            lastTriggerTime = now
-            Log.info("Mic pressed (\(keyID)).")
-            emitter.trigger()
-        case 0:
-            pressedMicKeys.remove(keyID)
+
+            guard !pressedMicKeys.contains(keyID) else {
+                if configuration.verbose {
+                    Log.info("Ignored repeated Mic down for \(keyID).")
+                }
+                return
+            }
+
+            pendingGestureFinalization?.cancel()
+            pendingGestureFinalization = nil
+            if gestureStartedAt == nil {
+                gestureStartedAt = now
+            }
+            gestureLastReleasedAt = nil
+            pressedMicKeys.insert(keyID)
+
             if configuration.verbose {
-                Log.info("Mic released (\(keyID)).")
+                Log.info("Mic down (\(keyID)).")
+            }
+        case 0:
+            if quarantinedMicKeys.remove(keyID) != nil {
+                if configuration.verbose {
+                    Log.info("Reconnect-state Mic key returned up (\(keyID)).")
+                }
+                return
+            }
+
+            // A release without a down observed by this process is not a
+            // physical gesture and must never produce a shortcut.
+            guard pressedMicKeys.remove(keyID) != nil else {
+                if configuration.verbose {
+                    Log.info("Ignored unmatched Mic up for \(keyID).")
+                }
+                return
+            }
+
+            if configuration.verbose {
+                Log.info("Mic up (\(keyID)).")
+            }
+
+            if pressedMicKeys.isEmpty {
+                gestureLastReleasedAt = now
+                scheduleGestureFinalization()
             }
         default:
             if configuration.verbose {
                 Log.info("Ignored Mic action \(action) for \(keyID).")
             }
         }
+    }
+
+    private func scheduleGestureFinalization() {
+        pendingGestureFinalization?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finalizeMicGesture()
+        }
+        pendingGestureFinalization = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + MicGesture.switchCoalescingWindow,
+            execute: workItem
+        )
+    }
+
+    private func finalizeMicGesture() {
+        pendingGestureFinalization = nil
+        guard
+            pressedMicKeys.isEmpty,
+            let startedAt = gestureStartedAt,
+            let releasedAt = gestureLastReleasedAt
+        else {
+            return
+        }
+
+        gestureStartedAt = nil
+        gestureLastReleasedAt = nil
+
+        let duration = releasedAt - startedAt
+        guard
+            duration >= MicGesture.minimumPressDuration,
+            duration <= MicGesture.maximumPressDuration
+        else {
+            Log.info("Ignored implausible Mic gesture (\(Int(duration * 1_000)) ms).")
+            return
+        }
+
+        guard releasedAt - lastTriggerTime >= MicGesture.triggerCooldown else {
+            Log.info("Coalesced duplicate Mic gesture.")
+            return
+        }
+
+        lastTriggerTime = releasedAt
+        Log.info("Mic gesture completed (\(Int(duration * 1_000)) ms).")
+        emitter.trigger()
+    }
+
+    private func resetMicGestureState() {
+        pendingGestureFinalization?.cancel()
+        pendingGestureFinalization = nil
+        pressedMicKeys.removeAll()
+        quarantinedMicKeys.removeAll()
+        gestureStartedAt = nil
+        gestureLastReleasedAt = nil
     }
 }
 

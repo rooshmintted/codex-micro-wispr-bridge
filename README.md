@@ -32,8 +32,9 @@ Grant the executable both permissions when macOS opens System Settings:
 - **Privacy & Security → Input Monitoring** to read report 6 from Codex Micro.
 - **Privacy & Security → Accessibility** to post the Wispr shortcut.
 
-With dry-run mode active, press the Mic key. The terminal should print a single
-`Mic pressed` line even if both switches under the wide key actuate.
+With dry-run mode active, press and release the Mic key. The terminal should
+print a single `Mic gesture completed` line even if both switches under the
+wide key actuate.
 
 Run the bridge for real:
 
@@ -76,9 +77,11 @@ codex-micro-wispr-bridge --trigger-once
 The bridge matches VID `0x303A`, PID `0x8360`, filters vendor report ID `6`,
 reassembles its newline-delimited JSON fragments, and recognizes Mic key IDs
 `ACT10`, `ACT11`, and `ACT10_ACT11`. It triggers once per physical press and
-coalesces the two switches under the wide key. It accepts both the compact
-production envelope (`m`/`p`) and the expanded compatibility envelope
-(`method`/`params`).
+coalesces the two switches under the wide key. To avoid false activations, it
+triggers only after a matching down/up gesture, rejects implausibly short or
+long transitions, and quarantines HID state replayed after a Bluetooth
+reconnect. It accepts both the compact production envelope (`m`/`p`) and the
+expanded compatibility envelope (`method`/`params`).
 
 ## Protocol status
 
