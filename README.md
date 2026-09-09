@@ -8,6 +8,14 @@ layers.
 The bridge opens the device non-exclusively. It does not reconfigure the
 keyboard, write to it, or seize it from ChatGPT/Codex.
 
+## Why this exists
+
+Wispr Flow can bind ordinary macOS keyboard shortcuts, but the Codex Micro Mic
+button is delivered through the keyboard's private vendor HID protocol instead
+of as a normal keypress. This helper translates that device event into a
+shortcut Wispr Flow already understands, so the Mic button works directly from
+Layer 1.
+
 ## Before running
 
 1. In Wispr Flow, open **Settings → General → Shortcuts → Hands-free mode** and
@@ -73,6 +81,8 @@ codex-micro-wispr-bridge --dry-run --verbose
 # Verify synthetic shortcut delivery without pressing the Micro
 codex-micro-wispr-bridge --trigger-once
 ```
+
+## How it works
 
 The bridge matches VID `0x303A`, PID `0x8360`, filters vendor report ID `6`,
 reassembles its newline-delimited JSON fragments, and recognizes Mic key IDs
